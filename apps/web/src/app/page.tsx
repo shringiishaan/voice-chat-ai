@@ -48,6 +48,7 @@ export default function VoiceChatPage() {
   const analyserRef = useRef<AnalyserNode | null>(null);
   const microphoneRef = useRef<MediaStreamAudioSourceNode | null>(null);
   const silenceTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const processingTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const animationFrameRef = useRef<number | null>(null);
   const isRecordingRef = useRef<boolean>(false); // Track recording state with ref
 
@@ -145,6 +146,16 @@ export default function VoiceChatPage() {
     
     // Set processing state
     setIsProcessingAudio(true);
+    
+    // Safety timeout: if no response in 10 seconds, reset processing state
+    processingTimeoutRef.current = setTimeout(() => {
+      console.log('⚠️ Processing timeout - resetting state');
+      setIsProcessingAudio(false);
+      if (!isRecordingRef.current) {
+        console.log('🔄 Resuming recording after timeout');
+        resumeRecording();
+      }
+    }, 10000);
     
     // Store chunks before clearing
     const chunksToProcess = [...audioChunksRef.current];
@@ -247,6 +258,12 @@ export default function VoiceChatPage() {
       };
       setMessages(prev => [...prev, messageWithDate]);
       
+      // Clear processing timeout
+      if (processingTimeoutRef.current) {
+        clearTimeout(processingTimeoutRef.current);
+        processingTimeoutRef.current = null;
+      }
+      
       // Reset processing state
       setIsProcessingAudio(false);
       
@@ -285,6 +302,26 @@ export default function VoiceChatPage() {
 
     socket.on('error', (error) => {
       console.error('Socket error:', error);
+    });
+
+    // Handle processing complete (for empty messages or other cases)
+    socket.on('processing-complete', (data) => {
+      console.log('Processing complete:', data);
+      
+      // Clear processing timeout
+      if (processingTimeoutRef.current) {
+        clearTimeout(processingTimeoutRef.current);
+        processingTimeoutRef.current = null;
+      }
+      
+      setIsProcessingAudio(false);
+      // Resume recording after a short delay
+      setTimeout(() => {
+        if (!isRecordingRef.current) {
+          console.log('🔄 Resuming recording after processing complete');
+          resumeRecording();
+        }
+      }, 500);
     });
 
     return () => {

@@ -63,6 +63,11 @@ async function triggerChatGPTWithWait(userInput: string, socketId: string, socke
   const trimmedInput = userInput.trim();
   if (!trimmedInput) {
     console.log(`   🚫 Empty message detected, skipping ChatGPT processing`);
+    // Send processing complete signal to frontend to reset state
+    socket.emit('processing-complete', { 
+      message: 'Empty message detected, no processing needed',
+      timestamp: new Date().toISOString()
+    });
     return;
   }
 
