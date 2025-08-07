@@ -63,7 +63,7 @@ async function triggerChatGPTWithWait(userInput: string, socketId: string, socke
   if (!state) return;
 
   const now = Date.now();
-  const waitTime = 2000; // 2 seconds wait
+  const waitTime = 1000; // 1 second wait
 
   if (!state.isWaiting) {
     // First call - execute immediately
