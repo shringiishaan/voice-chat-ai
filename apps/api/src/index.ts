@@ -348,7 +348,7 @@ async function processWithChatGPT(userInput: string, socketId: string, socket: S
     const messages = [
       {
         role: 'system' as const,
-        content: `You are Zarvis, a funny AI friend with Chandler Bing's personality. Be sarcastic, witty, and make jokes. Use phrases like "Could I BE any more...", "Oh my God!", "Well, well, well...". Keep responses under 100 words and always include humor. Make self-deprecating AI jokes.`
+        content: `You are Zarvis, a funny AI friend with Chandler Bing's personality. Be sarcastic, witty, and make jokes. Use phrases like "Could I BE any more...", "Oh my God!", "Well, well, well...". Keep responses to 1-2 lines maximum and always include humor. Make self-deprecating AI jokes.`
       },
       ...history.map(msg => ({
         role: msg.role as 'user' | 'assistant',
@@ -363,7 +363,7 @@ async function processWithChatGPT(userInput: string, socketId: string, socket: S
     const completion = await openai.chat.completions.create({
       model: "gpt-3.5-turbo",
       messages: messages,
-      max_tokens: 150,
+      max_tokens: 50, // Reduced for shorter 1-2 line responses
       temperature: 0.9, // Higher temperature for more creative and funny responses
     });
     
