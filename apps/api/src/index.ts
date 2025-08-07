@@ -26,7 +26,7 @@ const app = express();
 const server = createServer(app);
 const io = new Server(server, {
   cors: {
-    origin: process.env.FRONTEND_URL || "http://localhost:3000",
+    origin: "*", // Allow all origins for now
     methods: ["GET", "POST"]
   }
 });
@@ -103,7 +103,11 @@ async function triggerChatGPTWithWait(userInput: string, socketId: string, socke
 
 // Middleware
 app.use(helmet());
-app.use(cors());
+app.use(cors({
+  origin: "*", // Allow all origins for now
+  methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"]
+}));
 app.use(express.json());
 
 // Health check endpoint

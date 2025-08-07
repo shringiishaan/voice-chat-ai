@@ -1,8 +1,19 @@
 // API Configuration
+const getApiUrl = () => {
+  // Check if we're in production by looking at the hostname
+  if (typeof window !== 'undefined') {
+    const hostname = window.location.hostname;
+    if (hostname === 'fassix.com' || hostname === 'www.fassix.com') {
+      return 'https://fassix.com:12004';
+    }
+  }
+  
+  // Fallback to environment variable or localhost
+  return process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3001';
+};
+
 export const API_CONFIG = {
-  // Development: localhost:3001
-  // Production: https://fassix.com:12004
-  SOCKET_URL: process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3001',
+  SOCKET_URL: getApiUrl(),
   
   // Environment detection
   IS_PRODUCTION: process.env.NODE_ENV === 'production',
