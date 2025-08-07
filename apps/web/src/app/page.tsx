@@ -338,6 +338,9 @@ export default function VoiceChatPage() {
     if (!isRecordingRef.current && streamRef.current) {
       console.log('🔄 Resuming recording after AI response...');
       
+      // Play beep sound to indicate recording is starting
+      playBeepSound();
+      
       // Create new MediaRecorder
       const supportedTypes = MediaRecorder.isTypeSupported('audio/webm;codecs=opus') 
         ? 'audio/webm;codecs=opus' 
