@@ -59,6 +59,13 @@ const chatGPTCallStates = new Map<string, ChatGPTCallState>();
 
 // Custom wait function for ChatGPT calls
 async function triggerChatGPTWithWait(userInput: string, socketId: string, socket: Socket): Promise<void> {
+  // Check for empty or whitespace-only messages
+  const trimmedInput = userInput.trim();
+  if (!trimmedInput) {
+    console.log(`   🚫 Empty message detected, skipping ChatGPT processing`);
+    return;
+  }
+
   const state = chatGPTCallStates.get(socketId);
   if (!state) return;
 
@@ -70,7 +77,7 @@ async function triggerChatGPTWithWait(userInput: string, socketId: string, socke
     console.log(`   🚀 First ChatGPT call - executing immediately`);
     state.isWaiting = true;
     state.lastCallTime = now;
-    await processWithChatGPT(userInput, socketId, socket);
+    await processWithChatGPT(trimmedInput, socketId, socket);
     
     // Set up wait period
     setTimeout(() => {
@@ -84,8 +91,8 @@ async function triggerChatGPTWithWait(userInput: string, socketId: string, socke
     }, waitTime);
   } else {
     // Subsequent call - queue it
-    console.log(`   ⏳ ChatGPT call in progress, queuing input: "${userInput}"`);
-    state.pendingInput = userInput;
+    console.log(`   ⏳ ChatGPT call in progress, queuing input: "${trimmedInput}"`);
+    state.pendingInput = trimmedInput;
   }
 }
 
