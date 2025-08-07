@@ -3,6 +3,7 @@
 import { useState, useRef, useEffect } from 'react';
 import { Mic, MicOff, Send, Settings, MessageCircle } from 'lucide-react';
 import { io, Socket } from 'socket.io-client';
+import { API_CONFIG } from '../config/api';
 
 // Types for audio streaming
 interface AudioStreamData {
@@ -206,7 +207,7 @@ export default function VoiceChatPage() {
 
   // Initialize Socket.IO connection
   useEffect(() => {
-    const socket = io('http://localhost:3001');
+    const socket = io(API_CONFIG.SOCKET_URL);
     socketRef.current = socket;
 
     socket.on('connect', () => {
