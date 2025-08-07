@@ -1,0 +1,26 @@
+{
+  "name": "voice-chat-ai",
+  "version": "1.0.0",
+  "description": "Voice Chat AI - A monorepo with Next.js frontend and Node.js backend",
+  "private": true,
+  "scripts": {
+    "dev": "pnpm --parallel --recursive run dev",
+    "build": "pnpm --recursive run build",
+    "start": "pnpm --recursive run start",
+    "start:prod": "pnpm build && pnpm --recursive run start",
+    "lint": "pnpm --recursive run lint",
+    "type-check": "pnpm --recursive run type-check",
+    "clean": "pnpm --recursive run clean"
+  },
+  "devDependencies": {
+    "@types/node": "^20.10.0",
+    "typescript": "^5.3.0",
+    "prettier": "^3.1.0",
+    "eslint": "^8.55.0"
+  },
+  "engines": {
+    "node": ">=18.0.0",
+    "pnpm": ">=8.0.0"
+  },
+  "packageManager": "pnpm@8.15.0"
+}
