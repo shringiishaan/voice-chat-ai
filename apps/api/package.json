@@ -12,8 +12,6 @@
     "clean": "rm -rf dist"
   },
   "dependencies": {
-    "@google-cloud/speech": "^7.2.0",
-    "@google-cloud/text-to-speech": "^6.2.0",
     "cors": "^2.8.5",
     "debounce": "^2.2.0",
     "dotenv": "^16.3.1",

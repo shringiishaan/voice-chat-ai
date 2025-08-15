@@ -16,7 +16,7 @@ export interface VoiceMessageData {
 }
 
 export interface AudioStreamData {
-  audioChunk: Buffer;
+  audioChunk: ArrayBuffer;
   isFinal: boolean;
   timestamp: Date;
 }

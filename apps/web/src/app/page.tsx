@@ -7,7 +7,7 @@ import { API_CONFIG } from '../config/api';
 
 // Types for audio streaming
 interface AudioStreamData {
-  audioChunk: Buffer;
+  audioChunk: ArrayBuffer;
   isFinal: boolean;
   timestamp: Date;
 }
@@ -38,6 +38,7 @@ export default function VoiceChatPage() {
   const [isUserSpeaking, setIsUserSpeaking] = useState(false);
   const [audioLevel, setAudioLevel] = useState(0);
   const [isProcessingAudio, setIsProcessingAudio] = useState(false);
+  const [isAIPlayingAudio, setIsAIPlayingAudio] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   
   // Socket.IO and audio refs
@@ -52,6 +53,8 @@ export default function VoiceChatPage() {
   const processingTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const animationFrameRef = useRef<number | null>(null);
   const isRecordingRef = useRef<boolean>(false); // Track recording state with ref
+  const currentAudioRef = useRef<HTMLAudioElement | null>(null);
+  const currentAudioUrlRef = useRef<string | null>(null);
 
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -99,8 +102,27 @@ export default function VoiceChatPage() {
     const isSpeaking = normalizedLevel > 0.1; // 10% threshold
     setIsUserSpeaking(isSpeaking);
 
-
-
+    // If AI audio is playing and the user starts speaking, interrupt playback
+    if (isSpeaking && isAIPlayingAudio) {
+      console.log('⛔ Interrupt: User speaking while AI audio playing');
+      try {
+        if (currentAudioRef.current) {
+          currentAudioRef.current.pause();
+        }
+      } catch {}
+      if (currentAudioUrlRef.current) {
+        URL.revokeObjectURL(currentAudioUrlRef.current);
+      }
+      currentAudioRef.current = null;
+      currentAudioUrlRef.current = null;
+      setIsAIPlayingAudio(false);
+      // Notify backend to invalidate current generation
+      if (socketRef.current) {
+        socketRef.current.emit('interrupt', { timestamp: new Date() });
+      }
+      // Clear any accumulated chunks to start a fresh utterance
+      audioChunksRef.current = [];
+    }
     // Reset silence timer if speaking
     if (isSpeaking) {
       if (silenceTimerRef.current) {
@@ -173,19 +195,17 @@ export default function VoiceChatPage() {
       chunks: chunksToProcess.length
     });
     
-    // Convert to buffer and send to server
+    // Send raw ArrayBuffer to server
     audioBlob.arrayBuffer().then((arrayBuffer) => {
-      const buffer = Buffer.from(arrayBuffer);
-      
       if (socketRef.current) {
         console.log('📤 Sending complete audio to server:', {
-          size: buffer.length,
+          size: arrayBuffer.byteLength,
           chunks: chunksToProcess.length,
           timestamp: new Date().toISOString()
         });
         
         socketRef.current.emit('audio-stream', {
-          audioChunk: buffer,
+          audioChunk: arrayBuffer,
           isFinal: true,
           timestamp: new Date()
         });
@@ -196,12 +216,7 @@ export default function VoiceChatPage() {
     if (!isSilenceTriggered) {
       stopRecording();
     } else {
-      // For silence-triggered processing, pause recording until AI response is complete
-      if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
-        console.log('⏸️ Pausing recording for AI processing...');
-        mediaRecorderRef.current.stop();
-        isRecordingRef.current = false; // Pause recording state
-      }
+      // Keep recording to support barge-in/interruptions during AI playback
     }
   };
 
@@ -372,13 +387,28 @@ export default function VoiceChatPage() {
     }
   };
 
-  // Play audio response from base64
+  // Base64 -> Blob helper and audio playback
+  const base64ToBlob = (base64: string, type = 'audio/mp3') => {
+    const byteChars = atob(base64);
+    const byteArrays: Uint8Array[] = [];
+    for (let offset = 0; offset < byteChars.length; offset += 512) {
+      const slice = byteChars.slice(offset, offset + 512);
+      const nums = new Array(slice.length);
+      for (let i = 0; i < slice.length; i++) nums[i] = slice.charCodeAt(i);
+      byteArrays.push(new Uint8Array(nums));
+    }
+    return new Blob(byteArrays, { type });
+  };
+
   const playAudioResponse = (audioBuffer: string) => {
     try {
       console.log('🔊 Creating audio blob from base64...');
-      const audioBlob = new Blob([Buffer.from(audioBuffer, 'base64')], { type: 'audio/mp3' });
+      const audioBlob = base64ToBlob(audioBuffer, 'audio/mp3');
       const audioUrl = URL.createObjectURL(audioBlob);
       const audio = new Audio(audioUrl);
+      currentAudioRef.current = audio;
+      currentAudioUrlRef.current = audioUrl;
+      setIsAIPlayingAudio(true);
       
       console.log('🔊 Starting audio playback...');
       audio.play().then(() => {
@@ -387,12 +417,20 @@ export default function VoiceChatPage() {
         console.error('❌ Error starting audio playback:', error);
         // Resume recording even if audio fails
         resumeRecording();
+        setIsAIPlayingAudio(false);
+        if (currentAudioUrlRef.current) {
+          URL.revokeObjectURL(currentAudioUrlRef.current);
+          currentAudioUrlRef.current = null;
+        }
       });
       
       // Clean up URL after playing and resume recording
       audio.onended = () => {
         console.log('🔊 Audio playback completed');
         URL.revokeObjectURL(audioUrl);
+        setIsAIPlayingAudio(false);
+        currentAudioRef.current = null;
+        currentAudioUrlRef.current = null;
         // Resume recording after TTS completes
         resumeRecording();
       };
@@ -400,6 +438,9 @@ export default function VoiceChatPage() {
       audio.onerror = (error) => {
         console.error('❌ Audio playback error:', error);
         URL.revokeObjectURL(audioUrl);
+        setIsAIPlayingAudio(false);
+        currentAudioRef.current = null;
+        currentAudioUrlRef.current = null;
         // Resume recording even if audio fails
         resumeRecording();
       };
@@ -407,6 +448,7 @@ export default function VoiceChatPage() {
       console.error('❌ Error creating audio blob:', error);
       // Resume recording even if audio fails
       resumeRecording();
+      setIsAIPlayingAudio(false);
     }
   };
 

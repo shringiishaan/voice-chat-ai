@@ -8,7 +8,7 @@ import OpenAI from 'openai';
 // Custom wait implementation for better UX
 // Types for audio streaming
 interface AudioStreamData {
-  audioChunk: Buffer;
+  audioChunk: ArrayBuffer | Buffer;
   isFinal: boolean;
   timestamp: Date;
 }
@@ -22,12 +22,20 @@ interface SpeechRecognitionResult {
 
 dotenv.config();
 
+// Validate required environment variables
+if (!process.env.OPENAI_API_KEY) {
+  console.error('❌ Missing OPENAI_API_KEY. Please set it in your environment.');
+  process.exit(1);
+}
+
 const app = express();
 const server = createServer(app);
+const allowedOrigin = process.env.CORS_ORIGIN || process.env.FRONTEND_URL || '*';
 const io = new Server(server, {
   cors: {
-    origin: "*", // Allow all origins for now
-    methods: ["GET", "POST"]
+    origin: allowedOrigin,
+    methods: ["GET", "POST"],
+    credentials: true
   }
 });
 
@@ -38,6 +46,7 @@ const openai = new OpenAI({
 
 // Audio buffer storage per socket
 const audioBuffers = new Map<string, Buffer[]>();
+const processingSockets = new Set<string>();
 
 // Conversation history storage per socket
 interface ConversationMessage {
@@ -56,6 +65,7 @@ interface ChatGPTCallState {
 }
 
 const chatGPTCallStates = new Map<string, ChatGPTCallState>();
+const conversationVersions = new Map<string, number>();
 
 // Custom wait function for ChatGPT calls
 async function triggerChatGPTWithWait(userInput: string, socketId: string, socket: Socket): Promise<void> {
@@ -104,9 +114,10 @@ async function triggerChatGPTWithWait(userInput: string, socketId: string, socke
 // Middleware
 app.use(helmet());
 app.use(cors({
-  origin: "*", // Allow all origins for now
+  origin: allowedOrigin,
   methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Authorization"]
+  allowedHeaders: ["Content-Type", "Authorization"],
+  credentials: true
 }));
 app.use(express.json());
 
@@ -126,6 +137,7 @@ io.on('connection', (socket: Socket) => {
   // Initialize audio buffer and conversation history for this socket
   audioBuffers.set(socket.id, []);
   conversationHistory.set(socket.id, []);
+  conversationVersions.set(socket.id, 0);
   
   // Initialize ChatGPT call state for this socket
   chatGPTCallStates.set(socket.id, {
@@ -138,7 +150,8 @@ io.on('connection', (socket: Socket) => {
   socket.on('audio-stream', async (data: AudioStreamData) => {
     try {
       console.log(`\n🎤 [${new Date().toISOString()}] Audio chunk received from ${socket.id}`);
-      console.log(`   📊 Chunk size: ${data.audioChunk.length} bytes`);
+      const chunkSize = (data.audioChunk as any)?.byteLength ?? (data.audioChunk as any)?.length ?? 0;
+      console.log(`   📊 Chunk size: ${chunkSize} bytes`);
       console.log(`   🏁 Is final: ${data.isFinal}`);
       console.log(`   ⏰ Timestamp: ${data.timestamp}`);
 
@@ -147,8 +160,8 @@ io.on('connection', (socket: Socket) => {
       if (buffer) {
         // Clear buffer first since we're processing one chunk at a time
         buffer.length = 0;
-        buffer.push(Buffer.from(data.audioChunk));
-        console.log(`   📦 Buffer updated: 1 chunk, ${data.audioChunk.length} bytes`);
+        buffer.push(Buffer.from(data.audioChunk as ArrayBuffer));
+        console.log(`   📦 Buffer updated: 1 chunk, ${chunkSize} bytes`);
       }
 
       // If this is the final chunk, process immediately
@@ -160,6 +173,15 @@ io.on('connection', (socket: Socket) => {
       console.error('❌ Error processing audio stream:', error);
       socket.emit('error', { message: 'Failed to process audio stream' });
     }
+  });
+
+  // Handle user interrupt (barge-in)
+  socket.on('interrupt', () => {
+    console.log(`⛔ Interrupt received from ${socket.id} - invalidating in-flight responses`);
+    // Increment conversation version to invalidate in-flight responses
+    conversationVersions.set(socket.id, (conversationVersions.get(socket.id) || 0) + 1);
+    // Stop typing indicator
+    socket.emit('ai-typing', { isTyping: false, timestamp: new Date().toISOString() });
   });
 
   // Handle text messages
@@ -209,6 +231,7 @@ io.on('connection', (socket: Socket) => {
     audioBuffers.delete(socket.id);
     conversationHistory.delete(socket.id);
     chatGPTCallStates.delete(socket.id);
+    conversationVersions.delete(socket.id);
   });
 });
 
@@ -224,14 +247,11 @@ async function processCompleteAudio(socket: Socket) {
     }
 
     // Check if we're already processing audio for this socket
-    const processingKey = `processing_${socket.id}`;
-    if ((global as any)[processingKey]) {
+    if (processingSockets.has(socket.id)) {
       console.log(`   ⚠️ Audio processing already in progress for: ${socket.id}`);
       return;
     }
-    
-    // Mark as processing
-    (global as any)[processingKey] = true;
+    processingSockets.add(socket.id);
 
     // Get the single audio chunk (buffer now only contains one chunk)
     const completeAudio = buffer[0];
@@ -299,8 +319,7 @@ async function processCompleteAudio(socket: Socket) {
     socket.emit('error', { message: 'Failed to process audio' });
   } finally {
     // Clear processing flag
-    const processingKey = `processing_${socket.id}`;
-    delete (global as any)[processingKey];
+    processingSockets.delete(socket.id);
   }
 }
 
@@ -361,11 +380,11 @@ async function processWithChatGPT(userInput: string, socketId: string, socket: S
     });
     
     // Prepare messages for ChatGPT
+    const systemPrompt = process.env.SYSTEM_PROMPT || 
+      "You are a helpful and friendly AI assistant. Keep responses concise and on-topic.";
+
     const messages = [
-      {
-        role: 'system' as const,
-        content: `You are Zarvis, a funny AI friend with Chandler Bing's personality. Be sarcastic, witty, and make jokes. Use phrases like "Could I BE any more...", "Oh my God!", "Well, well, well...". Keep responses to 1-2 lines maximum and always include humor. Make self-deprecating AI jokes.`
-      },
+      { role: 'system' as const, content: systemPrompt },
       ...history.map(msg => ({
         role: msg.role as 'user' | 'assistant',
         content: msg.content
@@ -376,11 +395,12 @@ async function processWithChatGPT(userInput: string, socketId: string, socket: S
     const startTime = Date.now();
     
     // Call ChatGPT API
+    const versionAtStart = conversationVersions.get(socketId) || 0;
     const completion = await openai.chat.completions.create({
-      model: "gpt-3.5-turbo",
+      model: "gpt-4o-mini",
       messages: messages,
-      max_tokens: 50, // Reduced for shorter 1-2 line responses
-      temperature: 0.9, // Higher temperature for more creative and funny responses
+      max_tokens: 120,
+      temperature: 0.7,
     });
     
     const endTime = Date.now();
@@ -392,6 +412,12 @@ async function processWithChatGPT(userInput: string, socketId: string, socket: S
     console.log(`   ⏱️ Processing time: ${processingTime}ms`);
     console.log(`   🎯 AI response: "${aiResponse}"`);
     
+    // If interrupted while waiting for response, ignore this result
+    if ((conversationVersions.get(socketId) || 0) !== versionAtStart) {
+      console.log('⚠️ AI response ignored due to user interruption/newer version');
+      return;
+    }
+
     // Add AI response to history
     history.push({
       role: 'assistant',
