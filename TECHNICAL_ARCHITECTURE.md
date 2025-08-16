@@ -46,14 +46,14 @@ voice-chat-ai/
 ### Backend (Node.js)
 - **Framework**: Express.js + Socket.IO
 - **Language**: TypeScript
-- **AI Integration**: OpenAI GPT-3.5-turbo + Whisper API
-- **Audio Processing**: Real-time streaming
+- **AI Integration**: OpenAI gpt-4o-mini + Whisper API + OpenAI TTS
+- **Audio Processing**: Low-latency, silence-triggered, barge-in supported
 - **Port**: 3001
 
 ## Data Flow
 
 ```
-User Speech → MediaRecorder → Silence Detection → Socket.IO → Backend Buffer → Whisper API → ChatGPT → TTS → Audio Response → Frontend → Resume Recording
+User Speech → MediaRecorder (40–100ms slices) → VAD/Endpointing → Socket.IO (ArrayBuffer) → Backend (per-socket buffer) → Whisper (STT) → LLM (gpt-4o-mini, system prompt) → TTS → Audio (base64) → Frontend playback → Continuous recording (supports barge‑in)
 ```
 
 ### Conversation Flow
@@ -75,10 +75,10 @@ User Speech → MediaRecorder → Silence Detection → Socket.IO → Backend Bu
 
 ### AI Processing Pipeline
 - **STT**: OpenAI Whisper API
-- **LLM**: OpenAI GPT-3.5-turbo
+- **LLM**: OpenAI gpt-4o-mini (system prompt adjustable via `SYSTEM_PROMPT`)
 - **TTS**: OpenAI TTS (alloy voice)
 - **Context**: Full conversation history
-- **Rate Limiting**: 2-second custom wait between calls
+- **Interrupts**: Client emits `interrupt`; server versioning ignores stale responses
 
 ### State Management
 - **Frontend**: React useState/useEffect
@@ -88,15 +88,16 @@ User Speech → MediaRecorder → Silence Detection → Socket.IO → Backend Bu
 ## Socket Events
 
 ### Frontend → Backend
-- `audio-stream`: Real-time audio chunks
+- `audio-stream`: Real-time audio chunks (ArrayBuffer)
 - `text-message`: Text input
 - `start-recording`: Recording start
 - `stop-recording`: Recording end
+- `interrupt`: User began speaking while AI speaking; cancel/ignore in-flight response
 
 ### Backend → Frontend
 - `message-received`: User message confirmation
 - `ai-typing`: Typing indicator
-- `ai-response`: AI response
+- `ai-response`: AI response (includes base64 audio)
 - `conversation-update`: Full chat history
 
 ## Error Handling
@@ -226,11 +227,19 @@ pnpm build
 
 ### Environment Variables
 
-Required in `apps/api/.env`:
+Backend `apps/api/.env`:
 ```env
 PORT=3001
 FRONTEND_URL=http://localhost:3000
-OPENAI_API_KEY=sk-...  # Your OpenAI API key
+CORS_ORIGIN=http://localhost:3000
+OPENAI_API_KEY=sk-...
+SYSTEM_PROMPT=You are a helpful and friendly AI assistant. Keep responses concise and on-topic.
+LOG_LEVEL=info
+```
+
+Frontend `apps/web/.env`:
+```env
+NEXT_PUBLIC_API_URL=http://localhost:3001
 ```
 
 ## Development Tools

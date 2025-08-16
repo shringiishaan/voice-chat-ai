@@ -5,9 +5,10 @@ This is the Node.js backend server for the AI Chat Assistant application, provid
 ## Features
 
 - 🎤 **Real-time Audio Streaming**: Socket.IO based audio streaming from frontend
-- 🗣️ **Speech-to-Text**: OpenAI Whisper API integration
-- 🔊 **Text-to-Speech**: Mock implementation (ready for TTS integration)
-- 🤖 **AI Response Generation**: Placeholder for AI model integration
+- 🗣️ **Speech-to-Text**: OpenAI Whisper API (Whisper) integration
+- 🔊 **Text-to-Speech**: OpenAI TTS (alloy) returns base64‑encoded audio
+- 🤖 **AI Response Generation**: OpenAI gpt-4o-mini with adjustable system prompt
+- 🧠 **Barge‑in / Interruptions**: Client can interrupt AI; server ignores stale responses
 - 📡 **Socket.IO Communication**: Real-time bidirectional communication
 
 ## Setup
@@ -37,35 +38,41 @@ Create a `.env` file in the `apps/api` directory:
 # Server Configuration
 PORT=3001
 FRONTEND_URL=http://localhost:3000
+CORS_ORIGIN=http://localhost:3000
 
 # OpenAI Configuration
 OPENAI_API_KEY=your_openai_api_key_here
+SYSTEM_PROMPT=You are a helpful and friendly AI assistant. Keep responses concise and on-topic.
+LOG_LEVEL=info
 ```
 
 ## Socket.IO Events
 
 ### Client to Server
 
-- `audio-stream`: Stream audio chunks from frontend
+- `audio-stream`: Stream audio chunks from frontend (ArrayBuffer payload)
 - `text-message`: Send text messages
 - `start-recording`: Start voice recording session
 - `stop-recording`: Stop voice recording session
+- `interrupt`: User started speaking during AI playback (invalidate current response)
 
 ### Server to Client
 
-- `ai-response`: AI response with text and audio
-- `speech-result`: Real-time speech recognition results
+- `ai-response`: AI response with text and base64 audio
+- `ai-typing`: Typing indicator start/stop
+- `message-received`: Echo of accepted user message
+- `speech-result`: Real-time speech recognition results (when applicable)
 - `error`: Error messages
 
 ## Audio Processing Flow
 
-1. **Frontend Recording**: User starts recording with MediaRecorder API
-2. **Audio Streaming**: Audio chunks sent via Socket.IO to backend
-3. **Buffer Management**: Backend accumulates audio chunks in buffer
-4. **Speech Recognition**: OpenAI Whisper API processes complete audio
-5. **AI Response**: Generated response (placeholder for now)
-6. **Text-to-Speech**: Mock audio response (ready for TTS integration)
-7. **Audio Response**: Audio sent back to frontend for playback
+1. **Frontend Recording**: User records via MediaRecorder (40–100ms chunks)
+2. **Audio Streaming**: Chunks sent as ArrayBuffer via Socket.IO
+3. **Buffer Management**: Backend keeps one chunk at a time (finalized on silence/manual stop)
+4. **Speech Recognition**: Whisper transcribes the final chunk
+5. **AI Response**: gpt-4o-mini generates a reply using `SYSTEM_PROMPT` + history
+6. **Text-to-Speech**: OpenAI TTS produces MP3, returned as base64
+7. **Audio Response**: Frontend plays audio; continuous recording supports barge‑in
 
 ## Development
 

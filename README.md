@@ -6,7 +6,7 @@ A real-time voice and text chat application with AI-powered conversations, featu
 
 - 🎤 **Real-time Voice Chat**: Speak naturally and get instant AI responses
 - 💬 **Text Chat**: Type messages for traditional chat experience
-- 🤖 **AI-Powered**: Powered by OpenAI GPT-3.5-turbo for intelligent conversations
+- 🤖 **AI-Powered**: Powered by OpenAI gpt-4o-mini for intelligent, fast responses
 - 🎯 **Speech Recognition**: Advanced Whisper API for accurate voice transcription
 - 📱 **iPhone-Style UI**: Clean, modern interface with professional design
 - ⚡ **Real-time Updates**: Live conversation flow with typing indicators
@@ -49,11 +49,11 @@ A real-time voice and text chat application with AI-powered conversations, featu
 ### Voice Chat
 1. **Click microphone** → Start recording
 2. **Speak naturally** → Voice activity detection shows when you're speaking
-3. **Wait for silence** → After 2 seconds of silence, audio is automatically processed
-4. **AI processes** → Your voice is converted to text using Whisper API
-5. **AI responds** → ChatGPT generates contextual responses with text-to-speech
-6. **Listen to response** → AI speaks back to you through your speakers
-7. **Ready for next message** → Recording automatically resumes for your next input
+3. **Natural endpointing** → After a short silence, audio is processed (supports barge‑in)
+4. **AI processes** → Your voice is converted to text using OpenAI Whisper
+5. **AI responds** → The assistant replies and speaks back using OpenAI TTS
+6. **Barge‑in** → If you start talking while AI is speaking, playback stops and your new input is handled immediately
+7. **Continuous flow** → Recording continues for seamless turn‑taking
 
 ### Text Chat
 1. Type your message → Press Enter → Get AI response
@@ -72,6 +72,7 @@ A real-time voice and text chat application with AI-powered conversations, featu
 ✅ **Voice & Text Chat** - Real-time conversations with AI
 ✅ **Speech Recognition** - Accurate voice-to-text conversion using Whisper API
 ✅ **Text-to-Speech** - AI responses spoken back to you using OpenAI TTS
+✅ **Barge‑in / Interruptions** - Start speaking anytime to interrupt AI and continue the conversation
 ✅ **Automatic Silence Detection** - Processes audio after 2 seconds of silence
 ✅ **Conversation History** - Maintains context throughout chat
 ✅ **Real-time Updates** - Live message streaming with typing indicators
@@ -91,6 +92,32 @@ A real-time voice and text chat application with AI-powered conversations, featu
 - `pnpm dev` - Start development servers
 - `pnpm build` - Build for production
 - `pnpm start` - Start production servers
+
+## Environment Variables
+
+Create `.env` files using the provided examples:
+
+- Backend `apps/api/.env`:
+```env
+PORT=3001
+FRONTEND_URL=http://localhost:3000
+CORS_ORIGIN=http://localhost:3000
+OPENAI_API_KEY=sk-...
+SYSTEM_PROMPT=You are a helpful and friendly AI assistant. Keep responses concise and on-topic.
+LOG_LEVEL=info
+```
+
+- Frontend `apps/web/.env`:
+```env
+NEXT_PUBLIC_API_URL=http://localhost:3001
+```
+
+In production, set:
+```env
+FRONTEND_URL=https://fassix.com
+CORS_ORIGIN=https://fassix.com
+NEXT_PUBLIC_API_URL=https://fassix.com:12004
+```
 
 ## Technical Information
 
