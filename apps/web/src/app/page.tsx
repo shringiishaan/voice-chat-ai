@@ -39,6 +39,9 @@ export default function VoiceChatPage() {
   const [audioLevel, setAudioLevel] = useState(0);
   const [isProcessingAudio, setIsProcessingAudio] = useState(false);
   const [isAIPlayingAudio, setIsAIPlayingAudio] = useState(false);
+  const [streamingMessageId, setStreamingMessageId] = useState<string | null>(null);
+  const [language, setLanguage] = useState<string>('auto');
+  const [partialTranscript, setPartialTranscript] = useState('');
   const messagesEndRef = useRef<HTMLDivElement>(null);
   
   // Socket.IO and audio refs
@@ -49,12 +52,16 @@ export default function VoiceChatPage() {
   const audioContextRef = useRef<AudioContext | null>(null);
   const analyserRef = useRef<AnalyserNode | null>(null);
   const microphoneRef = useRef<MediaStreamAudioSourceNode | null>(null);
-  const silenceTimerRef = useRef<NodeJS.Timeout | null>(null);
-  const processingTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const silenceTimerRef = useRef<number | null>(null);
+  const processingTimeoutRef = useRef<number | null>(null);
   const animationFrameRef = useRef<number | null>(null);
   const isRecordingRef = useRef<boolean>(false); // Track recording state with ref
   const currentAudioRef = useRef<HTMLAudioElement | null>(null);
   const currentAudioUrlRef = useRef<string | null>(null);
+  const audioQueueRef = useRef<Blob[]>([]);
+  const isPlayingRef = useRef<boolean>(false);
+  const streamingAudioActiveRef = useRef<boolean>(false);
+  const gotAudioDoneRef = useRef<boolean>(false);
 
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -116,6 +123,8 @@ export default function VoiceChatPage() {
       currentAudioRef.current = null;
       currentAudioUrlRef.current = null;
       setIsAIPlayingAudio(false);
+      isPlayingRef.current = false;
+      audioQueueRef.current = [];
       // Notify backend to invalidate current generation
       if (socketRef.current) {
         socketRef.current.emit('interrupt', { timestamp: new Date() });
@@ -180,37 +189,18 @@ export default function VoiceChatPage() {
       }
     }, 10000);
     
-    // Store chunks before clearing
-    const chunksToProcess = [...audioChunksRef.current];
-    
     // Clear chunks for next recording
     audioChunksRef.current = [];
     
-    // Combine all chunks
-    const audioBlob = new Blob(chunksToProcess, { type: 'audio/webm' });
-    
-    console.log('📊 Audio blob created:', {
-      size: audioBlob.size,
-      type: audioBlob.type,
-      chunks: chunksToProcess.length
-    });
-    
-    // Send raw ArrayBuffer to server
-    audioBlob.arrayBuffer().then((arrayBuffer) => {
-      if (socketRef.current) {
-        console.log('📤 Sending complete audio to server:', {
-          size: arrayBuffer.byteLength,
-          chunks: chunksToProcess.length,
-          timestamp: new Date().toISOString()
-        });
-        
-        socketRef.current.emit('audio-stream', {
-          audioChunk: arrayBuffer,
-          isFinal: true,
-          timestamp: new Date()
-        });
-      }
-    });
+    // Signal finalization to server without resending the whole buffer
+    if (socketRef.current) {
+      console.log('📤 Signaling finalization to server');
+      socketRef.current.emit('audio-stream', {
+        audioChunk: new ArrayBuffer(0),
+        isFinal: true,
+        timestamp: new Date()
+      });
+    }
     
     // Stop recording after processing (only if not triggered by silence)
     if (!isSilenceTriggered) {
@@ -258,7 +248,11 @@ export default function VoiceChatPage() {
         ...data.message,
         timestamp: new Date(data.message.timestamp)
       };
-      setMessages(prev => [...prev, messageWithDate]);
+      setMessages(prev => {
+        // Dedupe by id
+        if (prev.some(m => m.id === messageWithDate.id)) return prev;
+        return [...prev, messageWithDate];
+      });
     });
 
     socket.on('ai-typing', (data) => {
@@ -272,7 +266,10 @@ export default function VoiceChatPage() {
         ...data.message,
         timestamp: new Date(data.message.timestamp)
       };
-      setMessages(prev => [...prev, messageWithDate]);
+      setMessages(prev => {
+        if (prev.some(m => m.id === messageWithDate.id)) return prev;
+        return [...prev, messageWithDate];
+      });
       
       // Clear processing timeout
       if (processingTimeoutRef.current) {
@@ -290,6 +287,56 @@ export default function VoiceChatPage() {
       } else {
         console.log('⚠️ No audio buffer received from AI response');
       }
+    });
+
+    // Streaming handlers
+    socket.on('ai-message-start', (data) => {
+      // reset streaming audio state for a new AI message
+      audioQueueRef.current = [];
+      isPlayingRef.current = false;
+      streamingAudioActiveRef.current = true;
+      gotAudioDoneRef.current = false;
+      setStreamingMessageId(data.id);
+      setIsAITyping(true);
+      // Create a placeholder AI message
+      const placeholder: Message = {
+        id: data.id,
+        text: '',
+        sender: 'ai',
+        timestamp: new Date(),
+      };
+      setMessages(prev => [...prev, placeholder]);
+    });
+
+    socket.on('ai-token', (data) => {
+      setMessages(prev => prev.map(m => (
+        m.id === data.id ? { ...m, text: m.text + (data.token || '') } : m
+      )));
+    });
+
+    socket.on('ai-message-done', (data) => {
+      setIsAITyping(false);
+      setStreamingMessageId(null);
+    });
+
+    socket.on('ai-audio', (data) => {
+      if (data?.audioBuffer) {
+        playAudioResponse(data.audioBuffer);
+      }
+    });
+    // Streaming audio chunks
+    socket.on('ai-audio-chunk', (data) => {
+      const buf: ArrayBuffer | undefined = data?.audioBuffer;
+      if (buf && buf.byteLength > 0) {
+        // Enqueue as Blob to avoid base64 conversion
+        const blob = new Blob([buf], { type: 'audio/mp3' });
+        enqueueAudioBlob(blob);
+      }
+    });
+    socket.on('ai-audio-done', () => {
+      gotAudioDoneRef.current = true;
+      // In case nothing is playing, drain (will resume recording if empty)
+      drainAudioQueue();
     });
 
     // Legacy event handlers (for backward compatibility)
@@ -313,6 +360,9 @@ export default function VoiceChatPage() {
           isVoice: true,
         };
         setMessages(prev => [...prev, newMessage]);
+        setPartialTranscript('');
+      } else {
+        setPartialTranscript(result.text);
       }
     });
 
@@ -378,6 +428,17 @@ export default function VoiceChatPage() {
           if (audioChunksRef.current.length % 10 === 0) {
             console.log('📦 MediaRecorder chunks collected:', audioChunksRef.current.length);
           }
+          // Stream chunk to server for partial STT
+          try {
+            const buf = await event.data.arrayBuffer();
+            if (socketRef.current) {
+              socketRef.current.emit('audio-stream', {
+                audioChunk: buf,
+                isFinal: false,
+                timestamp: new Date()
+              });
+            }
+          } catch {}
         }
       };
 
@@ -389,81 +450,89 @@ export default function VoiceChatPage() {
 
   // Base64 -> Blob helper and audio playback
   const base64ToBlob = (base64: string, type = 'audio/mp3') => {
-    const byteChars = atob(base64);
-    const byteArrays: Uint8Array[] = [];
-    for (let offset = 0; offset < byteChars.length; offset += 512) {
-      const slice = byteChars.slice(offset, offset + 512);
-      const nums = new Array(slice.length);
-      for (let i = 0; i < slice.length; i++) nums[i] = slice.charCodeAt(i);
-      byteArrays.push(new Uint8Array(nums));
+    const binary = atob(base64);
+    const len = binary.length;
+    const bytes = new Uint8Array(len);
+    for (let i = 0; i < len; i++) {
+      bytes[i] = binary.charCodeAt(i);
     }
-    return new Blob(byteArrays, { type });
+    return new Blob([bytes.buffer], { type });
   };
 
-  const playAudioResponse = (audioBuffer: string) => {
+  const enqueueAudioBlob = (blob: Blob) => {
     try {
-      console.log('🔊 Creating audio blob from base64...');
-      const audioBlob = base64ToBlob(audioBuffer, 'audio/mp3');
-      const audioUrl = URL.createObjectURL(audioBlob);
-      const audio = new Audio(audioUrl);
-      currentAudioRef.current = audio;
-      currentAudioUrlRef.current = audioUrl;
-      setIsAIPlayingAudio(true);
-      
-      console.log('🔊 Starting audio playback...');
-      audio.play().then(() => {
-        console.log('✅ Audio playback started successfully');
-      }).catch((error) => {
-        console.error('❌ Error starting audio playback:', error);
-        // Resume recording even if audio fails
-        resumeRecording();
-        setIsAIPlayingAudio(false);
-        if (currentAudioUrlRef.current) {
-          URL.revokeObjectURL(currentAudioUrlRef.current);
-          currentAudioUrlRef.current = null;
-        }
-      });
-      
-      // Clean up URL after playing and resume recording
-      audio.onended = () => {
-        console.log('🔊 Audio playback completed');
-        URL.revokeObjectURL(audioUrl);
-        setIsAIPlayingAudio(false);
-        currentAudioRef.current = null;
-        currentAudioUrlRef.current = null;
-        // Resume recording after TTS completes
-        resumeRecording();
-      };
-      
-      audio.onerror = (error) => {
-        console.error('❌ Audio playback error:', error);
-        URL.revokeObjectURL(audioUrl);
-        setIsAIPlayingAudio(false);
-        currentAudioRef.current = null;
-        currentAudioUrlRef.current = null;
-        // Resume recording even if audio fails
-        resumeRecording();
-      };
+      audioQueueRef.current.push(blob);
+      if (!isPlayingRef.current) {
+        drainAudioQueue();
+      }
     } catch (error) {
       console.error('❌ Error creating audio blob:', error);
-      // Resume recording even if audio fails
-      resumeRecording();
       setIsAIPlayingAudio(false);
     }
+  };
+
+  const drainAudioQueue = () => {
+    if (isPlayingRef.current) return;
+    const next = audioQueueRef.current.shift();
+    if (!next) {
+      // If we got a stream end and nothing left, resume recording
+      if (gotAudioDoneRef.current) {
+        gotAudioDoneRef.current = false;
+        streamingAudioActiveRef.current = false;
+        resumeRecording();
+      }
+      return;
+    }
+    isPlayingRef.current = true;
+    setIsAIPlayingAudio(true);
+    const audioUrl = URL.createObjectURL(next);
+    const audio = new Audio(audioUrl);
+    currentAudioRef.current = audio;
+    currentAudioUrlRef.current = audioUrl;
+
+    audio.play().then(() => {
+      // playing
+    }).catch((error) => {
+      console.error('❌ Error starting audio playback:', error);
+      URL.revokeObjectURL(audioUrl);
+      isPlayingRef.current = false;
+      setIsAIPlayingAudio(false);
+      currentAudioRef.current = null;
+      currentAudioUrlRef.current = null;
+      // Try next chunk
+      drainAudioQueue();
+    });
+
+    audio.onended = () => {
+      URL.revokeObjectURL(audioUrl);
+      isPlayingRef.current = false;
+      setIsAIPlayingAudio(false);
+      currentAudioRef.current = null;
+      currentAudioUrlRef.current = null;
+      drainAudioQueue();
+    };
+
+    audio.onerror = (error) => {
+      console.error('❌ Audio playback error:', error);
+      URL.revokeObjectURL(audioUrl);
+      isPlayingRef.current = false;
+      setIsAIPlayingAudio(false);
+      currentAudioRef.current = null;
+      currentAudioUrlRef.current = null;
+      drainAudioQueue();
+    };
+  };
+
+  // Legacy helper: still accept base64 for backward compatibility
+  const playAudioResponse = (audioBufferBase64: string) => {
+    const blob = base64ToBlob(audioBufferBase64, 'audio/mp3');
+    enqueueAudioBlob(blob);
   };
 
   const handleSendMessage = () => {
     if (!inputText.trim() || !socketRef.current) return;
 
-    const newMessage: Message = {
-      id: Date.now().toString(),
-      text: inputText,
-      sender: 'user',
-      timestamp: new Date(),
-    };
-
-    setMessages(prev => [...prev, newMessage]);
-    
+    // Do not append locally; rely on server echo to avoid duplicates
     // Send text message to server
     socketRef.current.emit('text-message', {
       text: inputText,
@@ -472,6 +541,43 @@ export default function VoiceChatPage() {
     
     setInputText('');
   };
+
+  // Language selector
+  const LanguageSelector = () => (
+    <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+      <label style={{ fontSize: '0.75rem', color: '#6b7280' }}>Language:</label>
+      <select
+        value={language}
+        onChange={(e) => {
+          const value = e.target.value;
+          setLanguage(value);
+          socketRef.current?.emit('set-language', { language: value });
+        }}
+        style={{
+          padding: '0.25rem 0.5rem',
+          border: '1px solid #e5e7eb',
+          borderRadius: '8px',
+          background: '#fff',
+          color: '#1d1d1f',
+          fontSize: '0.75rem'
+        }}
+      >
+        <option value="auto">Auto</option>
+        <option value="en">English</option>
+        <option value="es">Spanish</option>
+        <option value="fr">French</option>
+        <option value="de">German</option>
+        <option value="it">Italian</option>
+        <option value="pt">Portuguese</option>
+        <option value="hi">Hindi</option>
+        <option value="ja">Japanese</option>
+        <option value="ko">Korean</option>
+        <option value="zh">Chinese</option>
+        <option value="ar">Arabic</option>
+        <option value="ru">Russian</option>
+      </select>
+    </div>
+  );
 
   const startRecording = async () => {
     try {
@@ -610,8 +716,6 @@ export default function VoiceChatPage() {
     }
   };
 
-
-
   const handleKeyPress = (e: React.KeyboardEvent) => {
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
@@ -701,18 +805,8 @@ export default function VoiceChatPage() {
               </span>
             </div>
             
-            {/* Settings Button */}
-            <button style={{ 
-              padding: '0.5rem', 
-              color: '#6b7280', 
-              background: 'none', 
-              border: 'none', 
-              cursor: 'pointer',
-              borderRadius: '8px',
-              transition: 'background-color 0.2s'
-            }}>
-              <Settings size={20} />
-            </button>
+            {/* Language Selector */}
+            <LanguageSelector />
           </div>
         </div>
       </header>
@@ -832,6 +926,21 @@ export default function VoiceChatPage() {
                     </div>
                   </div>
                 ))}
+                {partialTranscript && (
+                  <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
+                    <div style={{
+                      maxWidth: '75%',
+                      padding: '0.5rem 0.75rem',
+                      borderRadius: '14px',
+                      background: '#e0f2fe',
+                      color: '#0c4a6e',
+                      fontStyle: 'italic',
+                      border: '1px dashed #93c5fd'
+                    }}>
+                      <p style={{ fontSize: '0.8rem' }}>{partialTranscript}</p>
+                    </div>
+                  </div>
+                )}
                 
                 {/* AI Typing Indicator */}
                 {isAITyping && (

@@ -35,7 +35,7 @@ const io = new Server(server, {
   cors: {
     origin: allowedOrigin,
     methods: ["GET", "POST"],
-    credentials: true
+    credentials: allowedOrigin !== '*'
   }
 });
 
@@ -47,6 +47,9 @@ const openai = new OpenAI({
 // Audio buffer storage per socket
 const audioBuffers = new Map<string, Buffer[]>();
 const processingSockets = new Set<string>();
+// Streaming STT helpers per socket
+const sttDebounceTimers = new Map<string, NodeJS.Timeout>();
+const sttInProgress = new Set<string>();
 
 // Conversation history storage per socket
 interface ConversationMessage {
@@ -56,6 +59,34 @@ interface ConversationMessage {
 }
 
 const conversationHistory = new Map<string, ConversationMessage[]>();
+
+// Per-socket language preferences
+interface ConversationPreferences {
+  targetLanguage: 'auto' | string; // BCP-47 code or 'auto'
+  lastDetectedLanguage?: string;   // Updated from STT results
+}
+
+const conversationPreferences = new Map<string, ConversationPreferences>();
+// Track last input source to tag user messages properly
+type InputSource = 'voice' | 'text';
+const lastInputSource = new Map<string, InputSource>();
+
+// Abort controllers for canceling in-flight work per socket
+interface InFlightControllers {
+  llm?: AbortController;
+  stt?: AbortController;
+  tts?: AbortController;
+}
+const controllersBySocket = new Map<string, InFlightControllers>();
+
+function abortInFlightControllers(socketId: string) {
+  const c = controllersBySocket.get(socketId);
+  if (!c) return;
+  try { c.llm?.abort(); } catch {}
+  try { c.stt?.abort(); } catch {}
+  try { c.tts?.abort(); } catch {}
+  controllersBySocket.set(socketId, {});
+}
 
 // Custom wait implementation for ChatGPT calls
 interface ChatGPTCallState {
@@ -138,6 +169,8 @@ io.on('connection', (socket: Socket) => {
   audioBuffers.set(socket.id, []);
   conversationHistory.set(socket.id, []);
   conversationVersions.set(socket.id, 0);
+  conversationPreferences.set(socket.id, { targetLanguage: 'auto' });
+  lastInputSource.set(socket.id, 'text');
   
   // Initialize ChatGPT call state for this socket
   chatGPTCallStates.set(socket.id, {
@@ -155,19 +188,27 @@ io.on('connection', (socket: Socket) => {
       console.log(`   🏁 Is final: ${data.isFinal}`);
       console.log(`   ⏰ Timestamp: ${data.timestamp}`);
 
-      // Add to buffer (will only have one chunk at a time now)
+      // Add to buffer (append for streaming)
       const buffer = audioBuffers.get(socket.id);
       if (buffer) {
-        // Clear buffer first since we're processing one chunk at a time
-        buffer.length = 0;
         buffer.push(Buffer.from(data.audioChunk as ArrayBuffer));
-        console.log(`   📦 Buffer updated: 1 chunk, ${chunkSize} bytes`);
+        // Trim buffer if it grows too large (keep last ~1.5MB)
+        const maxBytes = 1_500_000;
+        let total = buffer.reduce((acc, b) => acc + b.length, 0);
+        while (total > maxBytes && buffer.length > 1) {
+          const removed = buffer.shift();
+          total -= removed ? removed.length : 0;
+        }
+        console.log(`   📦 Buffer updated: ${buffer.length} chunks, ~${total} bytes`);
       }
 
       // If this is the final chunk, process immediately
       if (data.isFinal) {
         console.log(`\n🎯 [${new Date().toISOString()}] Final chunk received, processing immediately...`);
         await processCompleteAudio(socket);
+      } else {
+        // Schedule partial transcription for streaming STT
+        schedulePartialTranscription(socket);
       }
     } catch (error) {
       console.error('❌ Error processing audio stream:', error);
@@ -180,6 +221,8 @@ io.on('connection', (socket: Socket) => {
     console.log(`⛔ Interrupt received from ${socket.id} - invalidating in-flight responses`);
     // Increment conversation version to invalidate in-flight responses
     conversationVersions.set(socket.id, (conversationVersions.get(socket.id) || 0) + 1);
+    // Abort in-flight external calls
+    abortInFlightControllers(socket.id);
     // Stop typing indicator
     socket.emit('ai-typing', { isTyping: false, timestamp: new Date().toISOString() });
   });
@@ -193,12 +236,27 @@ io.on('connection', (socket: Socket) => {
 
       // Trigger ChatGPT processing with custom wait for text message
       console.log(`   🧠 Triggering ChatGPT processing with wait for text message...`);
+      lastInputSource.set(socket.id, 'text');
       await triggerChatGPTWithWait(data.text, socket.id, socket);
     } catch (error) {
       console.error(`\n❌ [${new Date().toISOString()}] Error processing text message:`);
       console.error(`   Error details:`, error);
       console.error(`   Socket ID: ${socket.id}`);
       socket.emit('error', { message: 'Failed to process text message' });
+    }
+  });
+
+  // Handle language preference updates
+  socket.on('set-language', (data: { language: string }) => {
+    try {
+      const lang = (data?.language || 'auto').trim();
+      const prefs = conversationPreferences.get(socket.id) || { targetLanguage: 'auto' };
+      prefs.targetLanguage = lang === '' ? 'auto' : (lang as any);
+      conversationPreferences.set(socket.id, prefs);
+      console.log(`🌐 Language preference updated for ${socket.id}:`, prefs.targetLanguage);
+      socket.emit('language-updated', { language: prefs.targetLanguage, timestamp: new Date().toISOString() });
+    } catch (e) {
+      console.error('❌ Error updating language preference:', e);
     }
   });
 
@@ -214,13 +272,9 @@ io.on('connection', (socket: Socket) => {
     console.log(`   🎯 Whisper API ready for speech recognition`);
   });
 
-  // Handle voice recording stop
+  // Handle voice recording stop (no-op for processing to avoid duplicate triggers)
   socket.on('stop-recording', async () => {
     console.log(`\n⏹️ [${new Date().toISOString()}] Recording stopped for ${socket.id}`);
-    console.log(`   🔄 Initiating audio processing pipeline...`);
-    
-    // Process the complete audio buffer
-    await processCompleteAudio(socket);
   });
 
   // Handle disconnection
@@ -253,10 +307,10 @@ async function processCompleteAudio(socket: Socket) {
     }
     processingSockets.add(socket.id);
 
-    // Get the single audio chunk (buffer now only contains one chunk)
-    const completeAudio = buffer[0];
-    console.log(`   📊 Audio chunk ready for processing:`);
-    console.log(`      - Chunk size: ${completeAudio.length} bytes`);
+    // Concatenate buffered chunks into single buffer
+    const completeAudio = Buffer.concat(buffer);
+    console.log(`   📊 Audio ready for processing:`);
+    console.log(`      - Total size: ${completeAudio.length} bytes`);
 
     // Skip processing if audio is empty
     if (completeAudio.length === 0) {
@@ -268,7 +322,7 @@ async function processCompleteAudio(socket: Socket) {
     audioBuffers.set(socket.id, []);
     console.log(`   🧹 Buffer cleared for ${socket.id}`);
 
-    // Process audio with Whisper API
+    // Process audio with Whisper API (auto language or preferred language)
     try {
       console.log(`\n🎤 [${new Date().toISOString()}] Initiating Whisper API call...`);
       console.log(`   📁 Creating audio file for Whisper API`);
@@ -283,12 +337,21 @@ async function processCompleteAudio(socket: Socket) {
       console.log(`   🚀 Calling OpenAI Whisper API...`);
       const startTime = Date.now();
       
-      // Call Whisper API
-      const transcription = await openai.audio.transcriptions.create({
+      // Determine language preference and mark input source
+      lastInputSource.set(socket.id, 'voice');
+      const prefs = conversationPreferences.get(socket.id) || { targetLanguage: 'auto' };
+
+      // Call Whisper API with verbose_json to capture detected language
+      const sttController = new AbortController();
+      const existing = controllersBySocket.get(socket.id) || {};
+      existing.stt = sttController;
+      controllersBySocket.set(socket.id, existing);
+      const transcription: any = await openai.audio.transcriptions.create({
         file: audioFile,
         model: "whisper-1",
-        language: "en",
-        response_format: "text"
+        ...(prefs.targetLanguage !== 'auto' ? { language: prefs.targetLanguage } : {}),
+        response_format: "verbose_json",
+        signal: sttController.signal as any
       });
 
       const endTime = Date.now();
@@ -298,12 +361,20 @@ async function processCompleteAudio(socket: Socket) {
       console.log(`   ⏱️ Processing time: ${processingTime}ms`);
       console.log(`   📊 Audio size processed: ${completeAudio.length} bytes`);
       console.log(`   🎯 Transcription result:`);
-      console.log(`      "${transcription}"`);
-      console.log(`   📏 Transcription length: ${transcription.length} characters`);
+      console.log(`      "${transcription?.text || ''}"`);
+      console.log(`   🌐 Detected language: ${transcription?.language || 'unknown'}`);
+      console.log(`   📏 Transcription length: ${(transcription?.text || '').length} characters`);
+
+      // Update detected language if auto
+      if (transcription?.language) {
+        const current = conversationPreferences.get(socket.id) || { targetLanguage: 'auto' };
+        current.lastDetectedLanguage = transcription.language;
+        conversationPreferences.set(socket.id, current);
+      }
 
       // Trigger ChatGPT processing with custom wait
       console.log(`\n🧠 [${new Date().toISOString()}] Triggering ChatGPT processing with wait...`);
-      await triggerChatGPTWithWait(transcription, socket.id, socket);
+      await triggerChatGPTWithWait(transcription?.text || '', socket.id, socket);
       
     } catch (error) {
       console.error(`\n❌ [${new Date().toISOString()}] Whisper API error:`);
@@ -323,6 +394,58 @@ async function processCompleteAudio(socket: Socket) {
   }
 }
 
+// Streaming STT: schedule partial transcription on buffered audio
+function schedulePartialTranscription(socket: Socket) {
+  const existing = sttDebounceTimers.get(socket.id);
+  if (existing) clearTimeout(existing);
+  const timer = setTimeout(async () => {
+    try {
+      if (sttInProgress.has(socket.id)) return; // avoid overlapping STT
+      const buffer = audioBuffers.get(socket.id);
+      if (!buffer || buffer.length === 0) return;
+      const combined = Buffer.concat(buffer);
+      if (combined.length < 15000) return; // avoid very small audio
+      sttInProgress.add(socket.id);
+      console.log(`\n🗣️ [${new Date().toISOString()}] Partial STT on ~${combined.length} bytes`);
+
+      const audioBlob = new Blob([combined], { type: 'audio/webm' });
+      const audioFile = new File([audioBlob], 'partial.webm', { type: 'audio/webm' });
+
+      const prefs = conversationPreferences.get(socket.id) || { targetLanguage: 'auto' };
+      const sttController = new AbortController();
+      const existing = controllersBySocket.get(socket.id) || {};
+      existing.stt = sttController;
+      controllersBySocket.set(socket.id, existing);
+      const transcription: any = await openai.audio.transcriptions.create({
+        file: audioFile,
+        model: 'whisper-1',
+        ...(prefs.targetLanguage !== 'auto' ? { language: prefs.targetLanguage } : {}),
+        response_format: 'verbose_json',
+        signal: sttController.signal as any
+      });
+
+      socket.emit('speech-result', {
+        text: transcription?.text || '',
+        confidence: typeof transcription?.confidence === 'number' ? transcription.confidence : 0,
+        isFinal: false,
+        timestamp: new Date()
+      });
+
+      // Update detected language
+      if (transcription?.language) {
+        const current = conversationPreferences.get(socket.id) || { targetLanguage: 'auto' };
+        current.lastDetectedLanguage = transcription.language;
+        conversationPreferences.set(socket.id, current);
+      }
+    } catch (e) {
+      console.error('❌ Partial STT error:', e);
+    } finally {
+      sttInProgress.delete(socket.id);
+    }
+  }, 600); // debounce 600ms
+  sttDebounceTimers.set(socket.id, timer);
+}
+
 // Generate AI response (placeholder for now)
 async function generateAIResponse(userInput: string): Promise<string> {
   console.log(`   📝 Processing user input: "${userInput}"`);
@@ -337,7 +460,13 @@ async function generateAIResponse(userInput: string): Promise<string> {
   return response;
 }
 
-// Process user input with ChatGPT
+// Utility to keep conversation history bounded
+function pruneHistory(history: ConversationMessage[], maxMessages: number = 20): ConversationMessage[] {
+  if (history.length <= maxMessages) return history;
+  return history.slice(history.length - maxMessages);
+}
+
+// Process user input with ChatGPT (streams tokens to client)
 async function processWithChatGPT(userInput: string, socketId: string, socket: Socket): Promise<void> {
   try {
     console.log(`\n🧠 [${new Date().toISOString()}] Processing ChatGPT request:`);
@@ -363,7 +492,7 @@ async function processWithChatGPT(userInput: string, socketId: string, socket: S
       text: userInput,
       sender: 'user' as const,
       timestamp: history[history.length - 1].timestamp,
-      isVoice: true
+      isVoice: (lastInputSource.get(socketId) || 'text') === 'voice'
     };
     
     console.log(`   📤 Sending user message to frontend immediately...`);
@@ -383,40 +512,66 @@ async function processWithChatGPT(userInput: string, socketId: string, socket: S
     const systemPrompt = process.env.SYSTEM_PROMPT || 
       "You are a helpful and friendly AI assistant. Keep responses concise and on-topic.";
 
+    const prefs = conversationPreferences.get(socketId) || { targetLanguage: 'auto' };
+    const targetLanguage = prefs.targetLanguage === 'auto' ? (prefs.lastDetectedLanguage || 'auto') : prefs.targetLanguage;
+
+    const languageDirective = targetLanguage === 'auto'
+      ? 'Respond in the same language as the user input.'
+      : `Respond in ${targetLanguage}.`;
+
     const messages = [
-      { role: 'system' as const, content: systemPrompt },
+      { role: 'system' as const, content: `${systemPrompt}\n\n${languageDirective}` },
       ...history.map(msg => ({
         role: msg.role as 'user' | 'assistant',
         content: msg.content
       }))
     ];
     
-    console.log(`   🚀 Calling ChatGPT API with ${messages.length} messages...`);
+    console.log(`   🚀 Calling ChatGPT API (stream) with ${messages.length} messages...`);
     const startTime = Date.now();
     
     // Call ChatGPT API
     const versionAtStart = conversationVersions.get(socketId) || 0;
-    const completion = await openai.chat.completions.create({
+    const llmController = new AbortController();
+    const existing = controllersBySocket.get(socketId) || {};
+    existing.llm = llmController;
+    controllersBySocket.set(socketId, existing);
+    const stream = await openai.chat.completions.create({
       model: "gpt-4o-mini",
       messages: messages,
-      max_tokens: 120,
+      max_tokens: 240,
       temperature: 0.7,
+      stream: true,
+      signal: llmController.signal as any
     });
-    
+
+    // Start streaming events to client
+    const aiMessageId = Date.now().toString();
+    socket.emit('ai-message-start', {
+      id: aiMessageId,
+      timestamp: new Date().toISOString()
+    });
+
+    let aiResponse = '';
+    for await (const part of stream as any) {
+      // Interrupt check inside loop
+      if ((conversationVersions.get(socketId) || 0) !== versionAtStart) {
+        console.log('⚠️ Stream aborted due to user interruption/newer version');
+        socket.emit('ai-typing', { isTyping: false, timestamp: new Date().toISOString() });
+        return;
+      }
+      const token = part?.choices?.[0]?.delta?.content || '';
+      if (token) {
+        aiResponse += token;
+        socket.emit('ai-token', { id: aiMessageId, token, timestamp: new Date().toISOString() });
+      }
+    }
+
     const endTime = Date.now();
     const processingTime = endTime - startTime;
-    
-    const aiResponse = completion.choices[0]?.message?.content || 'Sorry, I could not generate a response.';
-    
-    console.log(`\n🤖 [${new Date().toISOString()}] ChatGPT response received!`);
+    console.log(`\n🤖 [${new Date().toISOString()}] ChatGPT stream complete!`);
     console.log(`   ⏱️ Processing time: ${processingTime}ms`);
-    console.log(`   🎯 AI response: "${aiResponse}"`);
-    
-    // If interrupted while waiting for response, ignore this result
-    if ((conversationVersions.get(socketId) || 0) !== versionAtStart) {
-      console.log('⚠️ AI response ignored due to user interruption/newer version');
-      return;
-    }
+    console.log(`   🎯 AI response (final): "${aiResponse}"`);
 
     // Add AI response to history
     history.push({
@@ -425,33 +580,37 @@ async function processWithChatGPT(userInput: string, socketId: string, socket: S
       timestamp: new Date()
     });
     
-    // Update conversation history
-    conversationHistory.set(socketId, history);
+    // Prune and update conversation history
+    const pruned = pruneHistory(history);
+    conversationHistory.set(socketId, pruned);
     
-    // Stop "AI is typing..." indicator
+    // Stop "AI is typing..." indicator and close streaming message
     console.log(`   🛑 Stopping "AI is typing..." indicator...`);
     socket.emit('ai-typing', {
       isTyping: false,
       timestamp: new Date().toISOString()
     });
+
+    socket.emit('ai-message-done', {
+      id: aiMessageId,
+      text: aiResponse,
+      timestamp: new Date().toISOString()
+    });
+
+    // Streaming TTS for AI response
+    console.log(`   🔊 Streaming speech for AI response...`);
+    await streamTextToSpeech(aiResponse, socket, aiMessageId, socketId);
     
-    // Generate speech for AI response
-    console.log(`   🔊 Generating speech for AI response...`);
-    const audioBuffer = await convertTextToSpeech(aiResponse);
-    
-    // Send AI response to frontend with audio
-    const aiMessage = {
-      id: history[history.length - 1].timestamp.getTime().toString(),
+    // Backward-compatibility final event (without audioBuffer now)
+    const aiMessageCompat = {
+      id: aiMessageId,
       text: aiResponse,
       sender: 'ai' as const,
-      timestamp: history[history.length - 1].timestamp,
+      timestamp: new Date(),
       isVoice: false
     };
-    
-    console.log(`   📤 Sending AI response with audio to frontend...`);
     socket.emit('ai-response', {
-      message: aiMessage,
-      audioBuffer: audioBuffer.toString('base64'), // Convert to base64 for transmission
+      message: aiMessageCompat,
       timestamp: new Date().toISOString()
     });
     
@@ -507,6 +666,31 @@ async function convertTextToSpeech(text: string): Promise<Buffer> {
     console.error('❌ [OpenAI TTS] Error generating speech:', error);
     // Return empty buffer on error
     return Buffer.alloc(0);
+  }
+}
+
+// Streaming TTS: naive sentence chunking then sequential synth and emit
+async function streamTextToSpeech(text: string, socket: Socket, messageId: string, socketId: string): Promise<void> {
+  try {
+    const sentences = text.match(/[^.!?]+[.!?]?/g) || [text];
+    for (const sentence of sentences) {
+      if (!sentence.trim()) continue;
+      // Abort/interrupt check before each chunk
+      const currentVersion = conversationVersions.get(socketId) || 0;
+      // If a newer version exists, stop streaming
+      if ((conversationVersions.get(socketId) || 0) !== currentVersion) {
+        break;
+      }
+      const buffer = await convertTextToSpeech(sentence.trim());
+      socket.emit('ai-audio-chunk', {
+        id: messageId,
+        audioBuffer: buffer,
+        timestamp: new Date().toISOString()
+      });
+    }
+    socket.emit('ai-audio-done', { id: messageId, timestamp: new Date().toISOString() });
+  } catch (error) {
+    console.error('❌ Streaming TTS error:', error);
   }
 }
 
