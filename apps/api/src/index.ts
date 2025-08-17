@@ -560,6 +560,7 @@ async function processWithChatGPT(userInput: string, socketId: string, socket: S
     
     console.log(`   🚀 Calling ChatGPT API (stream) with ${messages.length} messages...`);
     const startTime = Date.now();
+    let firstTokenMs: number | null = null;
     
     // Call ChatGPT API
     const versionAtStart = conversationVersions.get(socketId) || 0;
@@ -593,6 +594,10 @@ async function processWithChatGPT(userInput: string, socketId: string, socket: S
       }
       const token = part?.choices?.[0]?.delta?.content || '';
       if (token) {
+        if (firstTokenMs === null) {
+          firstTokenMs = Date.now() - startTime;
+          console.log(`   ⏱️ Time to first LLM token: ${firstTokenMs}ms`);
+        }
         aiResponse += token;
         socket.emit('ai-token', { id: aiMessageId, token, timestamp: new Date().toISOString() });
       }
@@ -704,6 +709,8 @@ async function convertTextToSpeech(text: string): Promise<Buffer> {
 async function streamTextToSpeech(text: string, socket: Socket, messageId: string, socketId: string): Promise<void> {
   try {
     const sentences = text.match(/[^.!?]+[.!?]?/g) || [text];
+    const ttsStart = Date.now();
+    let firstAudioMsLogged = false;
     for (const sentence of sentences) {
       if (!sentence.trim()) continue;
       // Abort/interrupt check before each chunk
@@ -713,6 +720,11 @@ async function streamTextToSpeech(text: string, socket: Socket, messageId: strin
         break;
       }
       const buffer = await convertTextToSpeech(sentence.trim());
+      if (!firstAudioMsLogged && buffer && buffer.length > 0) {
+        const firstAudioMs = Date.now() - ttsStart;
+        firstAudioMsLogged = true;
+        console.log(`   ⏱️ Time to first TTS audio chunk: ${firstAudioMs}ms`);
+      }
       socket.emit('ai-audio-chunk', {
         id: messageId,
         audioBuffer: buffer,
