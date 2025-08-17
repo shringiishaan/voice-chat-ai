@@ -5,6 +5,7 @@ import cors from 'cors';
 import helmet from 'helmet';
 import dotenv from 'dotenv';
 import OpenAI from 'openai';
+import { toFile } from 'openai/uploads';
 // Custom wait implementation for better UX
 // Types for audio streaming
 interface AudioStreamData {
@@ -349,14 +350,12 @@ async function processCompleteAudio(socket: Socket) {
     // Process audio with Whisper API (auto language or preferred language)
     try {
       console.log(`\n🎤 [${new Date().toISOString()}] Initiating Whisper API call...`);
-      console.log(`   📁 Creating audio file for Whisper API`);
-      console.log(`   📏 Audio file size: ${completeAudio.length} bytes`);
+      console.log(`   📁 Preparing audio for Whisper API`);
+      console.log(`   📏 Audio buffer size: ${completeAudio.length} bytes`);
       
-      // Create a Blob first, then convert to File for better compatibility
-      const audioBlob = new Blob([completeAudio], { type: 'audio/webm' });
-      const audioFile = new File([audioBlob], 'audio.webm', { type: 'audio/webm' });
-      console.log(`   ✅ Audio file created successfully`);
-      console.log(`   📊 File details: ${audioFile.name}, ${audioFile.size} bytes, ${audioFile.type}`);
+      // Use OpenAI SDK helper to create a File from Buffer in Node
+      const audioFile = await toFile(completeAudio, 'audio.webm', { type: 'audio/webm' });
+      console.log(`   ✅ Audio file prepared successfully`);
       
       console.log(`   🚀 Calling OpenAI Whisper API...`);
       const startTime = Date.now();
@@ -432,8 +431,7 @@ function schedulePartialTranscription(socket: Socket) {
       sttInProgress.add(socket.id);
       console.log(`\n🗣️ [${new Date().toISOString()}] Partial STT on ~${combined.length} bytes`);
 
-      const audioBlob = new Blob([combined], { type: 'audio/webm' });
-      const audioFile = new File([audioBlob], 'partial.webm', { type: 'audio/webm' });
+      const audioFile = await toFile(combined, 'partial.webm', { type: 'audio/webm' });
 
       const prefs = conversationPreferences.get(socket.id) || { targetLanguage: 'auto' };
       const sttController = new AbortController();
