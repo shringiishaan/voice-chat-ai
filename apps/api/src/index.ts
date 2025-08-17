@@ -99,7 +99,13 @@ const chatGPTCallStates = new Map<string, ChatGPTCallState>();
 const conversationVersions = new Map<string, number>();
 
 // Custom wait function for ChatGPT calls
-async function triggerChatGPTWithWait(userInput: string, socketId: string, socket: Socket): Promise<void> {
+// queueOnly: if true, only queue/update pending input and schedule after wait window
+async function triggerChatGPTWithWait(
+  userInput: string,
+  socketId: string,
+  socket: Socket,
+  queueOnly: boolean = false
+): Promise<void> {
   // Check for empty or whitespace-only messages
   const trimmedInput = userInput.trim();
   if (!trimmedInput) {
@@ -116,7 +122,25 @@ async function triggerChatGPTWithWait(userInput: string, socketId: string, socke
   if (!state) return;
 
   const now = Date.now();
-  const waitTime = 1000; // 1 second wait
+  const waitTime = 400; // reduced wait for snappier updates
+
+  if (queueOnly) {
+    // Update pending input and schedule a deferred run if not already waiting
+    state.pendingInput = trimmedInput;
+    if (!state.isWaiting) {
+      state.isWaiting = true;
+      state.lastCallTime = now;
+      setTimeout(() => {
+        state.isWaiting = false;
+        if (state.pendingInput) {
+          const pendingInput = state.pendingInput;
+          state.pendingInput = null;
+          triggerChatGPTWithWait(pendingInput, socketId, socket);
+        }
+      }, waitTime);
+    }
+    return;
+  }
 
   if (!state.isWaiting) {
     // First call - execute immediately
@@ -404,7 +428,7 @@ function schedulePartialTranscription(socket: Socket) {
       const buffer = audioBuffers.get(socket.id);
       if (!buffer || buffer.length === 0) return;
       const combined = Buffer.concat(buffer);
-      if (combined.length < 15000) return; // avoid very small audio
+      if (combined.length < 9000) return; // lower threshold for quicker partials
       sttInProgress.add(socket.id);
       console.log(`\n🗣️ [${new Date().toISOString()}] Partial STT on ~${combined.length} bytes`);
 
@@ -437,12 +461,19 @@ function schedulePartialTranscription(socket: Socket) {
         current.lastDetectedLanguage = transcription.language;
         conversationPreferences.set(socket.id, current);
       }
+
+      // Queue early LLM start on stable partial without duplicating messages
+      const partialText = (transcription?.text || '').trim();
+      if (partialText && partialText.length >= 8) {
+        lastInputSource.set(socket.id, 'voice');
+        await triggerChatGPTWithWait(partialText, socket.id, socket, true);
+      }
     } catch (e) {
       console.error('❌ Partial STT error:', e);
     } finally {
       sttInProgress.delete(socket.id);
     }
-  }, 600); // debounce 600ms
+  }, 350); // reduced debounce for faster partials
   sttDebounceTimers.set(socket.id, timer);
 }
 

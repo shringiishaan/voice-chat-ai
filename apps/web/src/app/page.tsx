@@ -142,12 +142,12 @@ export default function VoiceChatPage() {
     } else {
       // Start silence timer if not speaking and recording
       if (isRecordingRef.current && !silenceTimerRef.current) {
-        console.log('🔇 User stopped speaking, starting 2s silence timer');
+        console.log('🔇 User stopped speaking, starting 1.2s silence timer');
         silenceTimerRef.current = setTimeout(() => {
           console.log('🔇 Silence detected, processing audio...');
           processAudioChunks(true); // Mark as silence-triggered
           silenceTimerRef.current = null; // Clear the timer reference
-        }, 2000); // 2 seconds of silence
+        }, 1200); // 1.2 seconds of silence
       }
     }
 
@@ -168,7 +168,7 @@ export default function VoiceChatPage() {
 
     // Check if audio is too small (likely silence or noise)
     const totalSize = audioChunksRef.current.reduce((sum, chunk) => sum + chunk.size, 0);
-    if (totalSize < 5000) { // Less than 5KB is likely too small
+    if (totalSize < 3000) { // Less than ~3KB is likely too small
       console.log('⚠️ Audio too small to process:', totalSize, 'bytes, returning early');
       audioChunksRef.current = []; // Clear chunks
       return;
@@ -442,7 +442,7 @@ export default function VoiceChatPage() {
         }
       };
 
-      newMediaRecorder.start(100);
+      newMediaRecorder.start(60);
       isRecordingRef.current = true;
       console.log('✅ Recording resumed successfully');
     }
@@ -623,11 +623,22 @@ export default function VoiceChatPage() {
           if (audioChunksRef.current.length % 10 === 0) {
             console.log('📦 MediaRecorder chunks collected:', audioChunksRef.current.length);
           }
+          // Stream chunk to server for partial STT
+          try {
+            const buf = await event.data.arrayBuffer();
+            if (socketRef.current) {
+              socketRef.current.emit('audio-stream', {
+                audioChunk: buf,
+                isFinal: false,
+                timestamp: new Date()
+              });
+            }
+          } catch {}
         }
       };
 
       // Start recording with smaller timeslice for better responsiveness
-      mediaRecorder.start(100); // Collect data every 100ms for smoother analysis
+      mediaRecorder.start(60); // Collect data every ~60ms for smoother analysis
       setIsRecording(true);
       setIsListening(true);
       isRecordingRef.current = true; // Set ref immediately
@@ -647,7 +658,7 @@ export default function VoiceChatPage() {
       console.log('   📊 Recording settings:', {
         mimeType: mediaRecorder.mimeType,
         state: mediaRecorder.state,
-        timeslice: 100
+        timeslice: 60
       });
     } catch (error) {
       console.error('❌ Error starting recording:', error);
